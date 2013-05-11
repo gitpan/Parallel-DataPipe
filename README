@@ -1,0 +1,38 @@
+Parallel-DataPipe version 0.01
+=================================
+
+CPAN module Parallel::DataPipe for parallel data processing conveyor 
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+These should all be in perl's core:
+
+use Storable qw(freeze thaw);
+use IO::Select;
+use POSIX ":sys_wait_h";
+
+For tests:
+use Test::More tests => 21;
+use Time::HiRes qw(time);
+
+If found it uses Sereal module for serialization instead of Storable as it is more efficient.
+
+SOURCE REPOSITORY
+
+https://github.com/okharch/Parallel-DataPipe
+
+COPYRIGHT AND LICENCE
+
+All right reserved. This library is free software; you can redistribute it
+and/or modify it under the same terms as Perl itself.
+
+
