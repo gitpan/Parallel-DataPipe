@@ -1,6 +1,6 @@
 package Parallel::DataPipe;
 
-our $VERSION='0.01';
+our $VERSION='0.02';
 use 5.008; # Perl::MinimumVersion says that
 
 use strict;
@@ -10,10 +10,10 @@ use IO::Select;
 use POSIX ":sys_wait_h";
 use constant _EOF_ => (-(2 << 31)+1);
 
-
 # this should work with Windows NT or if user explicitly set that
 my $number_of_cpu_cores = $ENV{NUMBER_OF_PROCESSORS}; 
 sub number_of_cpu_cores {
+    $number_of_cpu_cores = $_[0] if @_; # setter
     return $number_of_cpu_cores if $number_of_cpu_cores;
     # this works correct only in unix environment. cygwin as well.
     $number_of_cpu_cores = scalar grep m{^processor\t:\s\d+\s*$},`cat /proc/cpuinfo`;
@@ -81,6 +81,7 @@ sub _put_data { my ($fh,$data) = @_;
 sub _fork_data_processor {
     my ($data_processor_callback) = @_;
     # create processor as fork
+    local $SIG{TERM} = sub {exit;}; # exit silently from data processors
     my $pid = fork();
     unless (defined $pid) {
         #print "say goodbye - can't fork!\n"; <>;
@@ -121,7 +122,6 @@ sub _create_data_processor {
         read_processed_data_pipe => $read_processed_data_pipe,  # pipe to read processed data from processor to main thread                                                                    
         is_free => 1,                                           # flag whether processor is free for processing data
                                                                 # (waits for data on read_raw_data_pipe )
-        data_processor => $data_processor                       # callback to subroutine which process data $_ => processed($_)
     };    
 }
 
@@ -138,14 +138,8 @@ sub _process_data {
     return 1 unless @free_processors;
     my $processor = shift(@free_processors);
     _put_data($processor->{write_raw_data_pipe},$data);
-    if (@$processors == 1) {
-        # debug (limited, be careful) purposes
-        # execute data processor in current thread
-        $processors->{data_processor}->(); 
-    } else {
-        $processor->{is_free} = 0; # now it's busy
-    }
-    return 0;
+    $processor->{is_free} = 0; # now it's busy
+    return 0; 
 }
 
 sub _receive_and_merge_data {
@@ -160,7 +154,6 @@ sub _receive_and_merge_data {
     my @read_processed_data_pipe = IO::Select->new(map $_->{read_processed_data_pipe},@busy_processors)->can_read();
     for my $rh (@read_processed_data_pipe) {
         local $_ = _get_data($rh);
-        #print "merge data:$_\n";
         $data_merge_code->();
         $_->{is_free} = 1 for grep $_->{read_processed_data_pipe} == $rh, @busy_processors;
     }
@@ -173,7 +166,7 @@ sub _kill_data_processors {
     my ($processors) = @_;
     my @pid_to_kill = map $_->{pid},@$processors;
     my %pid_to_wait = map {$_=>undef} @pid_to_kill;
-    kill(1,@pid_to_kill);
+    kill('SIGTERM',@pid_to_kill);
     while (keys %pid_to_wait) {
         my $pid = wait;
         last if $pid == -1;
@@ -214,12 +207,14 @@ sub run {
     # data processing conveyor. 
     while (defined(my $data = $input_iterator->())) {
         # _process_data returns true if all processor is busy.
-        # in this case we should wait for some of them
-        # using _receive_and_merge_data which waits 
-        # until at least one of them put processed data to pipe for parent
-        # which means it is free now
          if (_process_data($data,$processors)) {
+            # in this case we should wait for some of them
+            # using _receive_and_merge_data which waits 
+            # until at least one of them put processed data to pipe for parent
+            # which means it is free now
              _receive_and_merge_data($processors,$data_merge_code);
+             # because all the processors were busy it did not process data
+             # process it again, now some of them are free
              _process_data($data,$processors);
          }
     }
@@ -312,7 +307,7 @@ B<number_of_data_processors> - (optional) number of parallel data processors. if
 
 B<freeze>, B<thaw> - you can use alternative serializer. 
     for example if you know that you are working with array of words (0..65535) you can use
-    freeze => sub {pack('S*',$_[0])} and thaw => sub {unpack('S*',$_[0])}
+    freeze => sub {pack('S*',@{$_[0]})} and thaw => sub {[unpack('S*',$_[0])]}
     which will reduce the amount of bytes exchanged between processes.
     But do it as the last optimization resort only.
     In fact automatic choise is quite good and efficient.
@@ -362,7 +357,7 @@ For tests:
  use Time::HiRes qw(time);
 
 
-if found it uses Sereal module for serialization instead of Storable as it is more efficient.
+if found it uses Sereal module for serialization instead of Storable as the former is more efficient.
 
 =head1 BUGS 
 
