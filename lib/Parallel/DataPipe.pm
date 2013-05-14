@@ -1,6 +1,6 @@
 package Parallel::DataPipe;
 
-our $VERSION='0.02';
+our $VERSION='0.03';
 use 5.008; # Perl::MinimumVersion says that
 
 use strict;
@@ -97,15 +97,15 @@ sub _fork_data_processor {
 }
 
 sub _create_data_processor {
-    my ($process_data_callback,$fork_data_processor) = @_;
+    my ($process_data_callback) = @_;
     # row data pipe main => processor
     pipe(my $read_raw_data_pipe,my $write_raw_data_pipe);
     
     # processed data pipe processor => main
     pipe(my $read_processed_data_pipe,my $write_processed_data_pipe);
     
-    # make closure for single-thread debug purposes
     my $data_processor = sub {
+	# wait for data from raw data pipe
         local $_ = _get_data($read_raw_data_pipe);
         # process data with given subroutine
         $_ = $process_data_callback->($_);
@@ -115,9 +115,7 @@ sub _create_data_processor {
     
     # return data processor record 
     return {
-        $fork_data_processor? (
-        pid => _fork_data_processor($data_processor)            # needed to kill processor when there is no more data to process
-        ) : (),
+        pid => _fork_data_processor($data_processor),            # needed to kill processor when there is no more data to process
         write_raw_data_pipe => $write_raw_data_pipe,            # pipe to write raw data from main to data processor 
         read_processed_data_pipe => $read_processed_data_pipe,  # pipe to read processed data from processor to main thread                                                                    
         is_free => 1,                                           # flag whether processor is free for processing data
@@ -128,8 +126,7 @@ sub _create_data_processor {
 sub _create_data_processors {
     my ($process_data_callback,$number_of_data_processors) = @_;
     die "process_data parameter should be code ref" unless ref($process_data_callback) eq 'CODE';
-    my $fork_data_processor = $number_of_data_processors > 1;
-    return [map _create_data_processor($process_data_callback,$fork_data_processor), 1..$number_of_data_processors];
+    return [map _create_data_processor($process_data_callback), 1..$number_of_data_processors];
 }
 
 sub _process_data {
@@ -247,11 +244,16 @@ C<Parallel::DataPipe> - parallel data processing conveyor
 
 =head1 DESCRIPTION
 
-If you have some long running script processing data item by item (having on input some data and having on output some processed data i.e. aggregation, webcrawling,etc) here is good news for you:
 
-You can speed it up 4-20 times with minimal efforts from you. Modern computer (even modern smartphones ;) ) have multiple CPU cores: 2,4,8, even 24! And huge amount of memory: memory is cheap now. So they are ready for parallel data processing. With this script there is an easy and flexible way to use that power.
+If you have some long running script processing data item by item
+(having on input some data and having on output some processed data i.e. aggregation, webcrawling,etc)
+you can speed it up 4-20 times using parallel datapipe conveyour.
+Modern computer (even modern smartphones ;) ) have multiple CPU cores: 2,4,8, even 24!
+And huge amount of memory: memory is cheap now.
+So they are ready for parallel data processing.
+With this script there is an easy and flexible way to use that power.
 
-Well, it is not the first method on parallelizm in Perl. You could write an efficient crawler using single core and framework like Coro::LWP or AnyEvent::HTTP::LWP. Also you can elegantly use all your cpu cores for parallel processing using Parallel::Loop. So what are the benefits of this module?
+So what are the benefits of this module?
 
 1) because it uses input_iterator it does not have to know all input data before starting parallel processing
 
@@ -262,8 +264,10 @@ Well, it is not the first method on parallelizm in Perl. You could write an effi
 If you don't want to overload your database with multiple simultaneous queries
 you make queries only within input_iterator and then process_data and then flush it with merge_data.
 On the other hand you usually win if make queries in process_data and do a lot of data processors.
-This guarantees full load of your cpu capabilities.
+Possibly even more then physical cores if database queries takes a long time and then small amount to process.
+
 It's not surprise, that DB servers usually serves N queries simultaneously faster then N queries one by one.
+
 Make tests and you will know.
 
 To (re)write your script for using all processing power of your server you have to find out:
@@ -313,27 +317,32 @@ B<freeze>, B<thaw> - you can use alternative serializer.
     In fact automatic choise is quite good and efficient.
     It uses encode_sereal and decode_sereal if Sereal module is found.
     Otherwise it use Storable freeze and thaw.
-=head3 How It Works
 
-1. Main thread (parent) forks C<number_of_data_processors> of children for processing data.
+=head2 HOW IT WORKS
 
-2. As soon as data comes from C<input_iterator> it sends it to to next child using
-serialization and pipe mechanizm.
+1) Main thread (parent) forks C<number_of_data_processors> of children for processing data.
 
-3. Child deserialize it, process it, serialize the result and put it to pipe for parent.
+2) As soon as data comes from C<input_iterator> it sends it to next child using
+pipe mechanizm.
 
-4. Parent firstly fills up all the pipes to children with data and then starts to expect processed data on pipes from children.
+3) Child processes data and returns result back to parent using pipe.
 
-5. If it receives data from chidlren it sends processed data to C<data_merge> subroutine,
-puts new portion of unprocessed data to that childs pipe (step 2).
+4) Parent firstly fills up all the pipes to children with data and then
+starts to expect processed data on pipes from children.
 
-6. This conveyor works until input data is ended (end of C<input_iterator> array or C<input_iterator> sub returned undef).
+5) If it receives result from chidlren it sends processed data to C<data_merge> subroutine,
+and starts loop 2) again.
 
-7. In the end parent expects processed data from all busy chidlren and puts processed data to C<data_merge>
+6) loop 2) continues until input data is ended (end of C<input_iterator> array or C<input_iterator> sub returned undef).
 
-8. After having all the children sent processed data they are killed and run returns to the caller.
+7) In the end parent expects processed data from all busy chidlren and puts processed data to C<data_merge>
 
+8) After having all the children sent processed data they are killed and run returns to the caller.
 
+Note:
+ If C<input_iterator> or <process_data> returns reference, it serialize/deserialize data before/after pipe.
+ That way you have full control whether data will be serialized on IPC.
+ 
 =head1 SEE ALSO
 
 L<fork|http://perldoc.perl.org/functions/fork.html>
@@ -341,6 +350,10 @@ L<fork|http://perldoc.perl.org/functions/fork.html>
 L<subs::parallel>
 
 L<Parallel::Loops>
+
+L<MCE>
+
+L<Parallel::parallel_map>
 
 =head1 DEPENDENCIES
 
