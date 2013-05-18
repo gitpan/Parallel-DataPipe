@@ -1,45 +1,92 @@
 package Parallel::DataPipe;
 
-our $VERSION='0.03';
+our $VERSION='0.04';
 use 5.008; # Perl::MinimumVersion says that
 
 use strict;
 use warnings;
-use Storable qw(freeze thaw);
 use IO::Select;
-use POSIX ":sys_wait_h";
-use constant _EOF_ => (-(2 << 31)+1);
+use List::Util qw(first max min);
+use constant PIPE_MAX_CHUNK_SIZE => ($^O eq 'MSWin32'?1024:16*1024);
+use constant _EOF_ => (-(1<<31));
+
+# input_iterator is either array or subroutine reference which puts data into conveyor    
+# convert it to sub ref anyway to simplify conveyor loop
+sub _get_input_iterator {
+    my $input_iterator = shift;
+    die "input_iterator is required parameter" unless defined($input_iterator);
+    unless (ref($input_iterator) eq 'CODE') {
+        die "array or code reference expected for input_iterator" unless ref($input_iterator) eq 'ARRAY';
+        my $array = $input_iterator;
+        my $l = @$array;
+        my $i = 0;
+        $input_iterator = sub {$i < $l? $array->[$i++]:undef};
+    }
+    return $input_iterator;
+}
+
+
+sub run {
+    my $param = shift;
+    my $input_iterator = _get_input_iterator(delete $param->{'input_iterator'});
+    my $conveyor = Parallel::DataPipe->new($param);
+    $SIG{ALRM} = 'IGNORE';
+    # data processing conveyor. 
+    while (defined(my $data = $input_iterator->())) {
+        $conveyor->process_data($data);
+    }    
+    # receive and merge remaining data from busy processors
+    my $busy_processors = $conveyor->busy_processors;
+    $conveyor->receive_and_merge_data() while $busy_processors--;
+}
 
 # this should work with Windows NT or if user explicitly set that
 my $number_of_cpu_cores = $ENV{NUMBER_OF_PROCESSORS}; 
 sub number_of_cpu_cores {
-    $number_of_cpu_cores = $_[0] if @_; # setter
+    #$number_of_cpu_cores = $_[0] if @_; # setter
     return $number_of_cpu_cores if $number_of_cpu_cores;
-    # this works correct only in unix environment. cygwin as well.
-    $number_of_cpu_cores = scalar grep m{^processor\t:\s\d+\s*$},`cat /proc/cpuinfo`;
+    eval {
+        # try unix (linux,cygwin,etc.)
+        $number_of_cpu_cores = scalar grep m{^processor\t:\s\d+\s*$},`cat /proc/cpuinfo 2>/dev/null`;
+        # try bsd
+        ($number_of_cpu_cores) = map m{hw.ncpu:\s+(\d+)},`sysctl -a` unless $number_of_cpu_cores;
+    };
     # otherwise it sets number_of_cpu_cores to 2
-    return $number_of_cpu_cores || 2;
+    return $number_of_cpu_cores || 1;
 }
 
-{ # begin of serializer block
-my $freeze;
-my $thaw;
+sub freeze {
+	my $self = shift;
+	$self->{freeze}->(@_);
+}
+
+sub thaw {
+	my $self = shift;
+	$self->{thaw}->(@_);
+}
 
 # this inits freeze and thaw with Storable subroutines and try to replace them with Sereal counterparts
 sub _init_serializer {
-    my $param = shift;
-    if (exists $param->{freeze} && ref($param->{freeze}) eq 'CODE' &&  exists $param->{thaw} && ref($param->{thaw}) eq 'CODE') {
-        $freeze = $param->{freeze};
-        $thaw = $param->{thaw};
+    my ($self,$param) = @_;
+    my ($freeze,$thaw) = grep $_ && ref($_) eq 'CODE',map delete $param->{$_},qw(freeze thaw);
+    if ($freeze && $thaw) {
+        $self->{freeze} = $freeze;
+        $self->{thaw} = $thaw;
     } else {
-        $freeze = \&freeze;
-        $thaw = \&thaw;
-        # try cereal 
+        # try cereal        
         eval q{
             use Sereal qw(encode_sereal decode_sereal);
-            $freeze = \&encode_sereal;
-            $thaw = \&decode_sereal;
+            $self->{freeze} = \&encode_sereal;
+            $self->{thaw} = \&decode_sereal;
+            1;
+        }
+        or
+        eval q{
+            use Storable;
+            $self->{freeze} = \&Storable::nfreeze;
+            $self->{thaw} = \&Storable::thaw; 
         };
+        
     }
     # don't make any assumptions on serializer capabilities, give all the power to user ;)
     # die "bad serializer!" unless join(",",@{$thaw->($freeze->([1,2,3]))}) eq '1,2,3';
@@ -50,33 +97,55 @@ sub _init_serializer {
 # or scalar - if size is negative
 # it always expects size of frozen scalar so it know how many it should read
 # to feed thaw 
-sub _get_data { my ($fh) = @_;    
-    my ($data_size,$data);
-    read $fh,$data_size,4;
+sub _get_data {
+    my ($self,$fh) = @_;
+    my ($data_size,$data,$process_num);
+    $fh->sysread($data_size,4);
     $data_size = unpack("l",$data_size);
-    return undef if ($data_size == _EOF_);
-    return  "" if $data_size == 0;
-    read $fh,$data,abs($data_size);
-    $data = $thaw->($data) if $data_size>0;
+    return undef if $data_size == _EOF_; # this if for process_data terminating
+    if ($data_size == 0) {
+        $data = '';
+    } else {
+        my $length = abs($data_size);
+        my $offset = 0;
+        # allocate all the buffer for $data beforehand
+        $data = sprintf("%${length}s","");
+        while ($offset < $length) {
+            my $chunk_size = min(PIPE_MAX_CHUNK_SIZE,$length-$offset);        
+            $fh->sysread(my $buf,$chunk_size);
+            # use lvalue form of substr to copy data in preallocated buffer        
+            substr($data,$offset,$chunk_size) = $buf;
+            $offset += $chunk_size;
+        }
+        $data = $self->thaw($data) if $data_size<0; 
+    }
     return $data;
 }
 
 # this subroutine serialize data reference. otherwise 
 # it puts negative size of scalar and scalar itself to pipe.
-# it also makes flush to avoid buffering blocks execution
-sub _put_data { my ($fh,$data) = @_;
-    if (!defined($data)) {
-        print $fh pack("l",_EOF_);
-    } elsif (ref($data)) {
-        $data = $freeze->($data);
-        print $fh pack("l", length($data)).$data;
-    } else {
-        print $fh pack("l",-length($data)).$data;        
+# parameter $process_num defined means it's child who is writing
+# to shared pipe to communicate with parent
+sub _put_data {
+    my ($self,$fh,$data) = @_;
+    unless (defined($data)) {
+        $fh->syswrite(pack("l", _EOF_));
+        return;        
     }
-    $fh->flush();
+    my $length = length($data);
+    if (ref($data)) {
+        $data = $self->freeze($data);
+        $length = -length($data);
+    }
+    $fh->syswrite(pack("l", $length));
+    $length = abs($length);
+    my $offset = 0;
+    while ($offset < $length) {
+        my $chunk_size = min(PIPE_MAX_CHUNK_SIZE,$length-$offset);        
+        $fh->syswrite(substr($data,$offset,$chunk_size));
+        $offset += $chunk_size;
+    }
 }
-
-} # end of serializer block
 
 sub _fork_data_processor {
     my ($data_processor_callback) = @_;
@@ -97,73 +166,76 @@ sub _fork_data_processor {
 }
 
 sub _create_data_processor {
-    my ($process_data_callback) = @_;
-    # row data pipe main => processor
-    pipe(my $read_raw_data_pipe,my $write_raw_data_pipe);
+    my ($self,$process_data_callback,$process_num) = @_;
     
-    # processed data pipe processor => main
-    pipe(my $read_processed_data_pipe,my $write_processed_data_pipe);
-    
+    # parent <=> child pipes
+    my ($parent_read, $parent_write) = pipely();
+    my ($child_read, $child_write) = pipely();
+ 
     my $data_processor = sub {
-	# wait for data from raw data pipe
-        local $_ = _get_data($read_raw_data_pipe);
-        # process data with given subroutine
+        local $_ = $self->_get_data($child_read);
+        exit 0 unless defined($_);
         $_ = $process_data_callback->($_);
-        # puts processed data back on pipe to main
-        _put_data($write_processed_data_pipe,$_);
+        $self->_put_data($parent_write,$_);
     };
     
     # return data processor record 
     return {
-        pid => _fork_data_processor($data_processor),            # needed to kill processor when there is no more data to process
-        write_raw_data_pipe => $write_raw_data_pipe,            # pipe to write raw data from main to data processor 
-        read_processed_data_pipe => $read_processed_data_pipe,  # pipe to read processed data from processor to main thread                                                                    
-        is_free => 1,                                           # flag whether processor is free for processing data
-                                                                # (waits for data on read_raw_data_pipe )
-    };    
+        pid => _fork_data_processor($data_processor),  # needed to kill processor when there is no more data to process
+        child_write => $child_write,                 # pipe to write raw data from main to data processor 
+        parent_read => $parent_read,                 # pipe to write raw data from main to data processor 
+    };
 }
 
 sub _create_data_processors {
-    my ($process_data_callback,$number_of_data_processors) = @_;
+    my ($self,$process_data_callback,$number_of_data_processors) = @_;
+    $number_of_data_processors = $self->number_of_cpu_cores unless $number_of_data_processors;
     die "process_data parameter should be code ref" unless ref($process_data_callback) eq 'CODE';
-    return [map _create_data_processor($process_data_callback), 1..$number_of_data_processors];
+	die "\$number_of_data_processors:undefined" unless defined($number_of_data_processors);
+    return [map $self->_create_data_processor($process_data_callback,$_), 0..$number_of_data_processors-1];
 }
 
-sub _process_data {
-    my ($data,$processors) = @_;
-    my @free_processors = grep $_->{is_free},@$processors;
-    return 1 unless @free_processors;
-    my $processor = shift(@free_processors);
-    _put_data($processor->{write_raw_data_pipe},$data);
-    $processor->{is_free} = 0; # now it's busy
-    return 0; 
-}
-
-sub _receive_and_merge_data {
-    my ($processors,$data_merge_code) = @_;
-    
-    my @busy_processors = grep $_->{is_free}==0,@$processors;
-    
-    # returns false if there is no busy processors
-    return 0 unless @busy_processors;
-    
-    # blocking read until at least one handle is ready
-    my @read_processed_data_pipe = IO::Select->new(map $_->{read_processed_data_pipe},@busy_processors)->can_read();
-    for my $rh (@read_processed_data_pipe) {
-        local $_ = _get_data($rh);
-        $data_merge_code->();
-        $_->{is_free} = 1 for grep $_->{read_processed_data_pipe} == $rh, @busy_processors;
+sub process_data {
+	my ($self,$data) = @_;
+    my $processor;
+    if ($self->{free_processors}) {
+        $processor = $self->{processors}[--$self->{free_processors}];
+    } else {
+        # wait for some processor which processed data
+        $processor = $self->receive_and_merge_data;
     }
-    
-    # returns true if there was busy processors 
-    return 1;        
-}    
+    $processor->{item_number} = $self->{item_number}++;
+    die "no support of data processing for undef items!" unless defined($data);
+    $self->_put_data($processor->{child_write},$data);
+}
+
+# this method is called once when input data is ended
+# to find out how many processors were involved in data processing
+# then it calls receive_and_merge_data 1..busy_processors times
+sub busy_processors {
+    my $self = shift;
+    return @{$self->{processors}} - $self->{free_processors};
+}
+
+sub receive_and_merge_data {
+	my $self = shift;
+    my ($processors,$data_merge_code,$ready) = @{$self}{qw(processors data_merge_code ready)};
+    $self->{ready} = $ready = [] unless $ready;
+    @$ready = IO::Select->new(map $_->{parent_read},@$processors)->can_read() unless @$ready;
+    my $fh = shift(@$ready);
+    my $processor = first {$_->{parent_read} == $fh} @$processors;
+    local $_ = $self->_get_data($fh);
+    $data_merge_code->($_,$processor->{item_number});
+    return $processor;
+}
     
 sub _kill_data_processors {
-    my ($processors) = @_;
-    my @pid_to_kill = map $_->{pid},@$processors;
+    my ($self) = @_;
+    my $processors = $self->{processors};
+    my @pid_to_kill = map $_->{pid}, @$processors;
     my %pid_to_wait = map {$_=>undef} @pid_to_kill;
-    kill('SIGTERM',@pid_to_kill);
+    # put undef to input of data_processor - they know it's time to exit
+    $self->_put_data($_->{child_write}) for @$processors;
     while (keys %pid_to_wait) {
         my $pid = wait;
         last if $pid == -1;
@@ -171,57 +243,202 @@ sub _kill_data_processors {
     }
 }
 
-sub _get_input_iterator {
-    my $input_iterator = shift;
-    unless (ref($input_iterator) eq 'CODE') {
-        die "array or code reference expected for input_iterator" unless ref($input_iterator) eq 'ARRAY';
-        my $array = $input_iterator;
-        my $l = @$array;
-        my $i = 0;
-        $input_iterator = sub {$i < $l? $array->[$i++]:undef};
-    }
-    return $input_iterator;
-}
-
-sub run {
-    my $param = shift;
-    
+sub new {
+    my ($class, $param) = @_;	
+	my $self = {};
+    bless $self,$class;    
+    # item_number for merge implementation
+    $self->{item_number} = 0;    
     # check if user want to use alternative serialisation routines
-    _init_serializer($param);
-    
-    # input_iterator is either array or subroutine reference which puts data into conveyor    
-    # convert it to sub ref anyway to simplify conveyor loop
-    my $input_iterator = _get_input_iterator($param->{'input_iterator'});
-    
+    $self->_init_serializer($param);    
     # @$processors is array with data processor info
-    my $processors = _create_data_processors($param->{'process_data'},$param->{'number_of_data_processors'} || number_of_cpu_cores); 
-    
+    $self->{processors} = $self->_create_data_processors(
+        map delete $param->{$_},qw(process_data number_of_data_processors)
+    );
+    # this counts processors which are still not involved in processing data
+    $self->{free_processors} = @{$self->{processors}};    
     # data_merge is sub which merge all processed data inside parent thread
     # it is called each time after process_data returns some new portion of data    
-    my $data_merge_code = $param->{'merge_data'};
-    die "data_merge should be code ref" unless ref($data_merge_code) eq 'CODE';
-    
-    # data processing conveyor. 
-    while (defined(my $data = $input_iterator->())) {
-        # _process_data returns true if all processor is busy.
-         if (_process_data($data,$processors)) {
-            # in this case we should wait for some of them
-            # using _receive_and_merge_data which waits 
-            # until at least one of them put processed data to pipe for parent
-            # which means it is free now
-             _receive_and_merge_data($processors,$data_merge_code);
-             # because all the processors were busy it did not process data
-             # process it again, now some of them are free
-             _process_data($data,$processors);
-         }
-    }
-    
-    # receive and merge remaining data from parallel processors
-    while (_receive_and_merge_data($processors,$data_merge_code)) {}
-
-    # now kill & rip all data processors
-    _kill_data_processors($processors);
+    $self->{data_merge_code} = delete $param->{'merge_data'};
+    die "data_merge should be code ref" unless ref($self->{data_merge_code}) eq 'CODE';    
+    my $not_supported = join ", ", keys %$param;
+    die "Parameters are not supported:". $not_supported if $not_supported;	
+	return $self;
 }
+
+sub DESTROY {
+	my $self = shift;
+    $self->_kill_data_processors;
+    #semctl($self->{sem_id},0,IPC_RMID,0);
+}
+
+=comment Why I copied IO::Pipely::pipely instead of use IO::Pipely qw(pipely)?
+1. Do not depend on installation of additional module
+2. I don't know (yet) how to win race condition:
+A) In Makefile.PL I would to check if fork & pipe works on the platform before creating Makefile.
+But I am not sure if it's ok that at that moment I can use pipely to create pipes.
+so
+B) to use pipely I have to create makefile
+For now I decided just copy code for pipely into this module.
+Then if I know how do win that race condition I will get rid of this code and
+will use IO::Pipely qw(pipely) instead and
+will add dependency on it.
+=cut
+# IO::Pipely is copyright 2000-2012 by Rocco Caputo.
+use Symbol qw(gensym);
+use IO::Socket qw(
+  AF_UNIX
+  PF_INET
+  PF_UNSPEC
+  SOCK_STREAM
+  SOL_SOCKET
+  SOMAXCONN
+  SO_ERROR
+  SO_REUSEADDR
+  inet_aton
+  pack_sockaddr_in
+  unpack_sockaddr_in
+);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use Errno qw(EINPROGRESS EWOULDBLOCK);
+
+my (@oneway_pipe_types, @twoway_pipe_types);
+if ($^O eq "MSWin32" or $^O eq "MacOS") {
+  @oneway_pipe_types = qw(inet socketpair pipe);
+  @twoway_pipe_types = qw(inet socketpair pipe);
+}
+elsif ($^O eq "cygwin") {
+  @oneway_pipe_types = qw(pipe inet socketpair);
+  @twoway_pipe_types = qw(inet pipe socketpair);
+}
+else {
+  @oneway_pipe_types = qw(pipe socketpair inet);
+  @twoway_pipe_types = qw(socketpair inet pipe);
+}
+
+sub pipely {
+  my %arg = @_;
+
+  my $conduit_type = delete($arg{type});
+  my $debug        = delete($arg{debug}) || 0;
+
+  # Generate symbols to be used as filehandles for the pipe's ends.
+  #
+  # Filehandle autovivification isn't used for portability with older
+  # versions of Perl.
+
+  my ($a_read, $b_write)  = (gensym(), gensym());
+
+  # Try the specified conduit type only.  No fallback.
+
+  if (defined $conduit_type) {
+    return ($a_read, $b_write) if _try_oneway_type(
+      $conduit_type, $debug, \$a_read, \$b_write
+    );
+  }
+
+  # Otherwise try all available conduit types until one works.
+  # Conduit types that fail are discarded for speed.
+
+  while (my $try_type = $oneway_pipe_types[0]) {
+    return ($a_read, $b_write) if _try_oneway_type(
+      $try_type, $debug, \$a_read, \$b_write
+    );
+    shift @oneway_pipe_types;
+  }
+
+  # There's no conduit type left.  Bummer!
+
+  $debug and warn "nothing worked";
+  return;
+}
+
+# Try a pipe by type.
+
+sub _try_oneway_type {
+  my ($type, $debug, $a_read, $b_write) = @_;
+
+  # Try a pipe().
+  if ($type eq "pipe") {
+    eval {
+      pipe($$a_read, $$b_write) or die "pipe failed: $!";
+    };
+
+    # Pipe failed.
+    if (length $@) {
+      warn "pipe failed: $@" if $debug;
+      return;
+    }
+
+    $debug and do {
+      warn "using a pipe";
+      warn "ar($$a_read) bw($$b_write)\n";
+    };
+
+    # Turn off buffering.  POE::Kernel does this for us, but
+    # someone might want to use the pipe class elsewhere.
+    select((select($$b_write), $| = 1)[0]);
+    return 1;
+  }
+
+  # Try a UNIX-domain socketpair.
+  if ($type eq "socketpair") {
+    eval {
+      socketpair($$a_read, $$b_write, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair failed: $!";
+    };
+
+    if (length $@) {
+      warn "socketpair failed: $@" if $debug;
+      return;
+    }
+
+    $debug and do {
+      warn "using a UNIX domain socketpair";
+      warn "ar($$a_read) bw($$b_write)\n";
+    };
+
+    # It's one-way, so shut down the unused directions.
+    shutdown($$a_read,  1);
+    shutdown($$b_write, 0);
+
+    # Turn off buffering.  POE::Kernel does this for us, but someone
+    # might want to use the pipe class elsewhere.
+    select((select($$b_write), $| = 1)[0]);
+    return 1;
+  }
+
+  # Try a pair of plain INET sockets.
+  if ($type eq "inet") {
+    eval {
+      ($$a_read, $$b_write) = _make_socket();
+    };
+
+    if (length $@) {
+      warn "make_socket failed: $@" if $debug;
+      return;
+    }
+
+    $debug and do {
+      warn "using a plain INET socket";
+      warn "ar($$a_read) bw($$b_write)\n";
+    };
+
+    # It's one-way, so shut down the unused directions.
+    shutdown($$a_read,  1);
+    shutdown($$b_write, 0);
+
+    # Turn off buffering.  POE::Kernel does this for us, but someone
+    # might want to use the pipe class elsewhere.
+    select((select($$b_write), $| = 1)[0]);
+    return 1;
+  }
+
+  # There's nothing left to try.
+  $debug and warn "unknown pipely() socket type ``$type''";
+  return;
+}
+
 
 1;
 
@@ -353,7 +570,9 @@ L<Parallel::Loops>
 
 L<MCE>
 
-L<Parallel::parallel_map>
+L<IO::Pipely> - pipes that work almost everywhere
+
+L<POE> - portable multitasking and networking framework for any event loop
 
 =head1 DEPENDENCIES
 
