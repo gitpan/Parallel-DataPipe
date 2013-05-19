@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Parallel-DataPipe
-version:            0.04
+version:            0.05
 abstract:           Parallel Data Processing Conveyor
 author:
     - Oleksandr Kharchenko <okharch@okharch.com>

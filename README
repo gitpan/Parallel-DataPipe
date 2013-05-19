@@ -1,9 +1,9 @@
-Parallel-DataPipe version 0.03
+Parallel-DataPipe version 0.05
 =================================
 
 CPAN module Parallel::DataPipe for parallel data processing conveyor
 
-Multiplatform implementation: tests are passed for MSWin32, Freebsd, Cygwin, Linux
+Multiplatform implementation: tests are passed for OpenBSD, MSWin32, Freebsd, Cygwin, Linux
 
 Thanks to Rocco Caputo's IO::Pipely::pipely where I got the idea how to communicate using mutliplatform pipes.
 
@@ -20,7 +20,7 @@ DEPENDENCIES
 
 It depends only on Core Perl modules now.
 
-If found it uses Sereal module for serialization instead of Storable as it is more efficient.
+if found it uses Sereal module for serialization instead of Storable as the former is more efficient.
 
 SOURCE REPOSITORY
 
