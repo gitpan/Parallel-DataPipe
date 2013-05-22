@@ -1,6 +1,6 @@
 package Parallel::DataPipe;
 
-our $VERSION='0.06';
+our $VERSION='0.07';
 use 5.008; # Perl::MinimumVersion says that
 
 use strict;
@@ -20,7 +20,6 @@ sub run {
     }
     
     my $conveyor = Parallel::DataPipe->new($param);
-    $SIG{ALRM} = 'IGNORE';
     # data processing conveyor. 
     while ($conveyor->load_data) {
         $conveyor->receive_and_merge_data unless $conveyor->free_processors;
@@ -32,6 +31,50 @@ sub run {
     return wantarray? @$result : $result;
 }
 
+sub pipeline {
+    my $class=shift;
+    if (ref($class) eq 'HASH') {
+        unshift @_, $class;
+        $class = __PACKAGE__;
+    }
+    my @pipes;
+    # init pipes
+    my $default_input;
+    for my $param (@_) {
+        unless (exists $param->{input}) {
+            $param->{input} = $default_input or die "You have to specify input for the first pipe";            
+        }
+        my $pipe = $class->new($param);
+        if (ref($pipe->{output}) eq 'ARRAY') {
+            $default_input = $pipe->{output};
+        }
+        push @pipes, $pipe;
+    }
+    run_pipes(0,@pipes);
+    my $result = $pipes[$#pipes]->{output};
+    # @pipes=() kills parent
+    # as well as its implicit destroying
+    # destroy pipes one by one if you want to survive!!! 
+    undef $_ for @pipes;
+    return unless defined(wantarray);
+    return unless $result;
+    return wantarray?@$result:$result;
+}
+
+sub run_pipes {
+    my ($prev_busy,$me,@next) = @_;
+    my $me_busy = $me->load_data || $me->busy_processors;
+    while ($me_busy) {
+        $me->receive_and_merge_data;
+        $me_busy = $me->load_data || $me->busy_processors;
+        my $next_busy = @next && run_pipes($prev_busy || $me_busy, @next);
+        $me_busy ||= $next_busy;
+        # get data from pipe if we have free_processors
+        return $me_busy if $prev_busy && $me->free_processors;
+    }
+    return 0;
+}
+
 # input_iterator is either array or subroutine reference which get's data from queue or other way and returns it
 # if there is no data it returns undef
 sub input_iterator {
@@ -41,7 +84,7 @@ sub input_iterator {
 
 sub output_iterator {
     my $self = shift;
-    $self->{output_iterator}->(@_)
+    $self->{output_iterator}->(@_);
 }
 
 # this is to set/create input iterator
@@ -141,8 +184,6 @@ sub init_serializer {
         };
         
     }
-    # don't make any assumptions on serializer capabilities, give all the power to user ;)
-    # die "bad serializer!" unless join(",",@{$thaw->($freeze->([1,2,3]))}) eq '1,2,3';
 }
 
 
@@ -201,13 +242,15 @@ sub _put_data {
 sub _fork_data_processor {
     my ($data_processor_callback) = @_;
     # create processor as fork
-    local $SIG{TERM} = sub {exit;}; # exit silently from data processors
     my $pid = fork();
     unless (defined $pid) {
         #print "say goodbye - can't fork!\n"; <>;
         die "can't fork!";
     }
     if ($pid == 0) {
+        local $SIG{TERM} = sub {
+            exit;
+        }; # exit silently from data processors
         # data processor is eternal loop which wait for raw data on pipe from main
         # data processor is killed when it's not needed anymore by _kill_data_processors
         $data_processor_callback->() while (1);
@@ -225,7 +268,9 @@ sub _create_data_processor {
  
     my $data_processor = sub {
         local $_ = $self->_get_data($child_read);
-        exit 0 unless defined($_);
+        unless (defined($_)) {
+            exit 0;
+        }
         $_ = $process_data_callback->($_);
         $self->_put_data($parent_write,$_);
     };
@@ -273,13 +318,13 @@ sub free_processors {
 
 sub receive_and_merge_data {
 	my $self = shift;
-    my ($processors,$data_merge_code,$ready) = @{$self}{qw(processors data_merge_code ready)};
+    my ($processors,$ready) = @{$self}{qw(processors ready)};
     $self->{ready} = $ready = [] unless $ready;
     @$ready = IO::Select->new(map $_->{busy} && $_->{parent_read},@$processors)->can_read() unless @$ready;
     my $fh = shift(@$ready);
     my $processor = first {$_->{parent_read} == $fh} @$processors;
     local $_ = $self->_get_data($fh);
-    $processor->{busy} = undef;
+    $processor->{busy} = undef; # make processor free
     $self->output_iterator($_,$processor->{item_number});
 }
     
@@ -502,10 +547,10 @@ C<Parallel::DataPipe> - parallel data processing conveyor
 
     use Parallel::DataPipe;
     Parallel::DataPipe::run {
-        input_iterator => [1..100],
-        process_data => sub { "$_:$$" },
+        input => [1..100],
+        process => sub { "$_:$$" },
         number_of_data_processors => 100,
-        merge_data => sub { print "$_\n" },
+        output => sub { print "$_\n" },
     };
     
 
@@ -547,6 +592,8 @@ To (re)write your script for using all processing power of your server you have 
 
 Take into account that 1) and 3) is executed in main script thread. While all 2) work is done in parallel forked threads. So for 1) and 3) it's better not to do things that block execution and remains hungry dogs 2) without meat to eat. So (still) this approach will benefit if you know that bottleneck in you script is CPU on processing step. Of course it's not the case for some web crawling tasks unless you do some heavy calculations
 
+=head1 SUBROUTINES
+
 =head2 run
 
 This is subroutine which covers magic of parallelizing data processing.
@@ -569,7 +616,7 @@ B<process> - reference to subroutine which process data items. they are passed v
     use any shared resources inside it.
     Also you can update children state, but it will not affect parent state.
     Also you can use these aliases:
-    process_data process processor map
+    process_data
 
 These parameters are optional and has reasonable defaults, so you change them only know what you do
 
@@ -578,7 +625,7 @@ B<output> - optional. either reference to a subroutine or array which receives p
 	this subroutine is executed in parent thread, so you can rely on changes that it made.
     if you don't specify this parameter array with processed data can be received as a subroutine result.
     You can use this aliseases for this parameter:
-    merge_data, output_iterator, output, output_queue, output_data, merge, reduce
+    merge_data, merge
 
 B<number_of_data_processors> - (optional) number of parallel data processors. if you don't specify,
     it tries to find out a number of cpu cores
@@ -600,12 +647,72 @@ B<freeze>, B<thaw> - you can use alternative serializer.
     It uses encode_sereal and decode_sereal if Sereal module is found.
     Otherwise it use Storable freeze and thaw.
 
-Note: run has also undocumented prototype for calling (\@\$) i.e.
+Note: run can also be called like this
     
     my @x2 = Parallel::DataPipe::run([1..100],sub {$_*2});
     
-This prototype is not guaranteed to be supported. Use it at your own risk.
-=head2 HOW IT WORKS
+This feature is considered as experimental. Use it at your own risk.
+
+=head2 pipeline
+  Here is parallel grep implemented in 40 lines of perl code:
+  use List::More qw(part);
+  my @dirs = '.';
+  my @files;
+  pipeline(
+    # this pipe looks (recursively) for all files in specified @dirs
+    { 
+        input => \@dirs,
+        process => sub {
+            my ($files,$dirs) = part -d?1:0,glob("$_/*");
+            return [$files,$dirs];
+        },
+        output => sub {
+            my ($files,$dirs) = @$_;
+            push @dirs,@$dirs;# recursion is here
+            push @files,@$files;
+        },
+    },
+    # this pipe grep files for word hello
+    {
+        input => \@files,
+        process => sub {
+            my ($file) = $_;
+            open my $fh, $file;
+            my @lines;
+            while (<$fh>) {
+                # line_number : line
+                push @lines,$. . ":" . $_ if m{hello};
+            }
+            return [$file,\@lines];
+        },
+        output => sub {
+            my ($file,$lines) = @$_;
+            # print filename, line_number , line
+            print "$file:$_" for @$lines;
+        }
+    }
+  );
+  
+  pipeline is a common case of run.
+  
+  run $pipe_params
+  
+  is the same as
+  
+  pipeline $pipe_params
+  
+  But with pipeline you can create as many pipes as you want and run all of them in parallel.
+  And it works like in unix - input of next pipe is output from previous pipe.
+  You have to specify input for the first pipe explicitly.
+  If you don't specify input for next pipe it is assumed that it is output from previous pipe like in unix.
+  Also this assumption that input of next pipe depends on output of previous is applied for algorithm
+on prioritizing of execution of pipe processors.
+As long as the very right (last in list) pipe has input to process it executes it's processes.
+If this pipe has free processor the processors from previous pipe is executed to get input data.
+  This is recursively applied for all chain of pipes.
+  Well, recursive algorith usually is coded much shorter, so you can look at implementation.
+
+=head1 HOW parallel pipe (run) WORKS
 
 1) Main thread (parent) forks C<number_of_data_processors> of children for processing data.
 
